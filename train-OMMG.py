@@ -33,12 +33,50 @@ try:
 except ImportError:
     TENSORBOARD_FOUND = False
 
+def _prefix_metrics(prefix, metrics):
+    return {f"{prefix}/{metric_name}": metric_value for metric_name, metric_value in metrics.items()}
+
+def _build_anchor_contribution_proxy(radii, opacity):
+    return radii.detach().clamp_min(0.0) * opacity.detach().reshape(-1)
+
+def _build_pairing_runtime_metrics(use_paired_views, pairing_summary, attempts, hits, sampling_fallbacks):
+    hit_rate = (hits / attempts) if attempts > 0 else 0.0
+    return {
+        "paired_view_enabled": float(bool(use_paired_views)),
+        "total_cameras_rgb": float(pairing_summary.get("total_cameras_rgb", 0)),
+        "total_cameras_thermal": float(pairing_summary.get("total_cameras_thermal", 0)),
+        "paired_camera_count": float(pairing_summary.get("paired_camera_count", 0)),
+        "paired_sampling_hit_rate": hit_rate if use_paired_views else 0.0,
+        "paired_sampling_fallback_count": float(sampling_fallbacks),
+        "paired_camera_fallback_count": float(pairing_summary.get("fallback_count", 0)),
+    }
+
 def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from):
     first_iter = 0
     tb_writer = prepare_output_and_logger(dataset)
-    gaussians = GaussianModel(dataset.sh_degree)
+    gaussians = GaussianModel(
+        dataset.sh_degree,
+        use_gbm=getattr(dataset, "use_gbm", False),
+        use_thermal_residual_geometry=getattr(dataset, "use_thermal_residual_geometry", False),
+        gbm_hidden_dim=getattr(dataset, "gbm_hidden_dim", 32),
+        gbm_gate_init_bias=getattr(dataset, "gbm_gate_init_bias", -2.2),
+        gbm_thermal_grayscale_context=getattr(dataset, "gbm_thermal_grayscale_context", True),
+        gbm_rgb_luma_transfer_only=getattr(dataset, "gbm_rgb_luma_transfer_only", True),
+    )
     scene = Scene(dataset, gaussians)
     gaussians.training_setup(opt)
+    use_paired_views = getattr(dataset, "use_paired_views", False)
+    pairing_summary = scene.getPairingSummary("train")
+    if use_paired_views and pairing_summary.get("paired_camera_count", 0) == 0:
+        print("[Warning] --use_paired_views enabled but no paired cameras were discovered. Falling back to the legacy train-camera pool.")
+    print(
+        "[Pairing:train] enabled={} rgb={} thermal={} paired={}".format(
+            use_paired_views,
+            pairing_summary.get("total_cameras_rgb", 0),
+            pairing_summary.get("total_cameras_thermal", 0),
+            pairing_summary.get("paired_camera_count", 0),
+        )
+    )
 
     if checkpoint:
         (model_params, first_iter) = torch.load(checkpoint)
@@ -51,6 +89,9 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     iter_end = torch.cuda.Event(enable_timing = True)
 
     viewpoint_stack = None
+    paired_sampling_attempts = 0
+    paired_sampling_hits = 0
+    paired_sampling_fallbacks = 0
 
     ema_loss_for_log = 0.0
     progress_bar = tqdm(range(first_iter, opt.iterations), desc="Training progress")
@@ -78,6 +119,11 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         iter_start.record()
 
         gaussians.update_learning_rate(iteration)
+        late_prune_phase_active = (
+            getattr(opt, "late_prune_only", False)
+            and iteration >= max(opt.densify_until_iter, getattr(opt, "late_prune_only_from_iter", opt.densify_until_iter))
+            and iteration <= getattr(opt, "late_prune_only_until_iter", opt.iterations)
+        )
 
         # Every 1000 its we increase the levels of SH up to a maximum degree
         if iteration % 1000 == 0:
@@ -85,9 +131,14 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
         # Pick a random Camera
         if not viewpoint_stack:
-            viewpoint_stack = scene.getTrainCameras().copy()
+            viewpoint_stack = scene.getTrainSamplingCameras(paired_only=use_paired_views).copy()
             
         viewpoint_cam = viewpoint_stack.pop(randint(0, len(viewpoint_stack)-1))
+        paired_sampling_attempts += 1
+        if use_paired_views and getattr(viewpoint_cam, "has_paired_view", False):
+            paired_sampling_hits += 1
+        elif use_paired_views:
+            paired_sampling_fallbacks += 1
         #print("viewpoint_cam is:",viewpoint_cam)
 
         # Render
@@ -111,7 +162,41 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         loss_color = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim(image, gt_image))
         Ll1_thermal = l1_loss(thermal, gt_thermal)
         loss_thermal = (1.0 - opt.lambda_dssim) * Ll1_thermal + opt.lambda_dssim * (1.0 - ssim(thermal, gt_thermal)) + 0.6 * smoothloss_thermal
-        loss= (loss_color + loss_thermal) * 0.5
+        thermal_residual_reg = Ll1.new_zeros(())
+        gbm_stability_reg = Ll1.new_zeros(())
+        gate_sparsity_reg = Ll1.new_zeros(())
+        gate_collapse_reg = Ll1.new_zeros(())
+        gate_overlap_reg = Ll1.new_zeros(())
+        gbm_log_metrics = {}
+        if gaussians.use_thermal_residual_geometry:
+            thermal_residual_reg = opt.thermal_residual_l1_weight * gaussians.get_thermal_residual_l1()
+        if gaussians.use_gbm:
+            gbm_stability_reg = render_pkg["gbm_stability_reg"]
+            gate_sparsity_reg = render_pkg["gbm_gate_sparsity_reg"]
+            gate_collapse_reg = render_pkg["gbm_gate_collapse_reg"]
+            gate_overlap_reg = render_pkg["gbm_gate_overlap_reg"]
+            gbm_log_metrics = {
+                "gate_th2rgb_mean": render_pkg["gbm_gate_th2rgb_mean"].detach().item(),
+                "gate_th2rgb_std": render_pkg["gbm_gate_th2rgb_std"].detach().item(),
+                "gate_th2rgb_max": render_pkg["gbm_gate_th2rgb_max"].detach().item(),
+                "gate_rgb2th_mean": render_pkg["gbm_gate_rgb2th_mean"].detach().item(),
+                "gate_rgb2th_std": render_pkg["gbm_gate_rgb2th_std"].detach().item(),
+                "gate_rgb2th_max": render_pkg["gbm_gate_rgb2th_max"].detach().item(),
+                "delta_th2rgb_mag_mean": render_pkg["gbm_delta_th2rgb_mag_mean"].detach().item(),
+                "delta_rgb2th_mag_mean": render_pkg["gbm_delta_rgb2th_mag_mean"].detach().item(),
+                "gbm_stability_reg": gbm_stability_reg.detach().item(),
+                "gate_sparsity_reg": gate_sparsity_reg.detach().item(),
+                "gate_collapse_reg": gate_collapse_reg.detach().item(),
+                "gate_overlap_reg": gate_overlap_reg.detach().item(),
+            }
+        loss= (
+            (loss_color + loss_thermal) * 0.5
+            + thermal_residual_reg
+            + opt.gbm_stability_weight * gbm_stability_reg
+            + opt.gbm_gate_sparsity_weight * gate_sparsity_reg
+            + opt.gbm_gate_collapse_weight * gate_collapse_reg
+            + opt.gbm_gate_overlap_weight * gate_overlap_reg
+        )
 
         # print("loss:",loss)
         torch.cuda.synchronize()
@@ -128,8 +213,155 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             if iteration == opt.iterations:
                 progress_bar.close()
 
+            pairing_runtime_metrics = _build_pairing_runtime_metrics(
+                use_paired_views=use_paired_views,
+                pairing_summary=pairing_summary,
+                attempts=paired_sampling_attempts,
+                hits=paired_sampling_hits,
+                sampling_fallbacks=paired_sampling_fallbacks,
+            )
+            if iteration >= getattr(opt, "anchor_stats_warmup_iters", 0):
+                anchor_stats_log_metrics = gaussians.update_anchor_multimodal_stats(
+                    rgb_visibility_filter=render_pkg["rgb_visibility_filter"],
+                    thermal_visibility_filter=render_pkg["thermal_visibility_filter"],
+                    rgb_contribution_proxy=_build_anchor_contribution_proxy(render_pkg["rgb_radii"], gaussians.get_opacity),
+                    thermal_contribution_proxy=_build_anchor_contribution_proxy(render_pkg["thermal_radii"], gaussians.get_opacity),
+                    rgb_residual_proxy=Ll1.detach(),
+                    thermal_residual_proxy=Ll1_thermal.detach(),
+                    gbm_usage_th2rgb=render_pkg["gbm_gate_th2rgb_anchor"],
+                    gbm_usage_rgb2th=render_pkg["gbm_gate_rgb2th_anchor"],
+                    thermal_geometry_usage=gaussians.get_anchor_thermal_geometry_usage(),
+                    ema=opt.anchor_stats_ema,
+                )
+            else:
+                anchor_stats_log_metrics = gaussians.get_anchor_multimodal_stats_summary()
+
+            joint_lifecycle_scores = gaussians.get_joint_lifecycle_scores(iteration=iteration)
+            joint_lifecycle_log_metrics = joint_lifecycle_scores["diagnostics"]
+
+            train_metric_scalars = {}
+            train_metric_scalars.update(_prefix_metrics("pairing", pairing_runtime_metrics))
+            train_metric_scalars.update(_prefix_metrics("anchor_stats", anchor_stats_log_metrics))
+            train_metric_scalars.update(_prefix_metrics("joint_lifecycle", joint_lifecycle_log_metrics))
+            if gbm_log_metrics:
+                train_metric_scalars.update(_prefix_metrics("gbm", gbm_log_metrics))
+
             # Log and save
-            training_report(tb_writer, iteration, Ll1, Ll1_thermal, loss, l1_loss, iter_start.elapsed_time(iter_end), testing_iterations, scene, render, (pipe, background))
+            if gaussians.use_gbm and (iteration == first_iter or iteration % 100 == 0):
+                print(
+                    "\n[ITER {}] GBM gate_th2rgb mean/std/max {:.6f} {:.6f} {:.6f} | "
+                    "gate_rgb2th mean/std/max {:.6f} {:.6f} {:.6f}".format(
+                        iteration,
+                        gbm_log_metrics["gate_th2rgb_mean"],
+                        gbm_log_metrics["gate_th2rgb_std"],
+                        gbm_log_metrics["gate_th2rgb_max"],
+                        gbm_log_metrics["gate_rgb2th_mean"],
+                        gbm_log_metrics["gate_rgb2th_std"],
+                        gbm_log_metrics["gate_rgb2th_max"],
+                    )
+                )
+                print(
+                    "[ITER {}] GBM delta_th2rgb_mag_mean {:.6f} delta_rgb2th_mag_mean {:.6f} | "
+                    "stability {:.6f} sparsity {:.6f} collapse {:.6f} overlap {:.6f}".format(
+                        iteration,
+                        gbm_log_metrics["delta_th2rgb_mag_mean"],
+                        gbm_log_metrics["delta_rgb2th_mag_mean"],
+                        gbm_log_metrics["gbm_stability_reg"],
+                        gbm_log_metrics["gate_sparsity_reg"],
+                        gbm_log_metrics["gate_collapse_reg"],
+                        gbm_log_metrics["gate_overlap_reg"],
+                    )
+                )
+            if iteration == first_iter or iteration % 100 == 0:
+                print(
+                    "[ITER {}] Pairing enabled={} paired={} hit_rate {:.6f} sample_fallbacks {} dataset_fallbacks {}".format(
+                        iteration,
+                        use_paired_views,
+                        int(pairing_runtime_metrics["paired_camera_count"]),
+                        pairing_runtime_metrics["paired_sampling_hit_rate"],
+                        int(pairing_runtime_metrics["paired_sampling_fallback_count"]),
+                        int(pairing_runtime_metrics["paired_camera_fallback_count"]),
+                    )
+                )
+                print(
+                    "[ITER {}] Anchor stats vis_rgb {:.6f}/{:.6f} vis_th {:.6f}/{:.6f} | "
+                    "contrib_rgb {:.6f}/{:.6f} contrib_th {:.6f}/{:.6f}".format(
+                        iteration,
+                        anchor_stats_log_metrics["visibility_rgb_mean"],
+                        anchor_stats_log_metrics["visibility_rgb_std"],
+                        anchor_stats_log_metrics["visibility_th_mean"],
+                        anchor_stats_log_metrics["visibility_th_std"],
+                        anchor_stats_log_metrics["contribution_rgb_mean"],
+                        anchor_stats_log_metrics["contribution_rgb_std"],
+                        anchor_stats_log_metrics["contribution_th_mean"],
+                        anchor_stats_log_metrics["contribution_th_std"],
+                    )
+                )
+                print(
+                    "[ITER {}] Anchor stats residual_rgb {:.6f}/{:.6f} residual_th {:.6f}/{:.6f} | "
+                    "gbm_usage_th2rgb {:.6f}/{:.6f} gbm_usage_rgb2th {:.6f}/{:.6f} | "
+                    "thermal_geom {:.6f}/{:.6f}".format(
+                        iteration,
+                        anchor_stats_log_metrics["residual_rgb_mean"],
+                        anchor_stats_log_metrics["residual_rgb_std"],
+                        anchor_stats_log_metrics["residual_th_mean"],
+                        anchor_stats_log_metrics["residual_th_std"],
+                        anchor_stats_log_metrics["gbm_usage_th2rgb_mean"],
+                        anchor_stats_log_metrics["gbm_usage_th2rgb_std"],
+                        anchor_stats_log_metrics["gbm_usage_rgb2th_mean"],
+                        anchor_stats_log_metrics["gbm_usage_rgb2th_std"],
+                        anchor_stats_log_metrics["thermal_geometry_usage_mean"],
+                        anchor_stats_log_metrics["thermal_geometry_usage_std"],
+                    )
+                )
+                print(
+                    "[ITER {}] Joint lifecycle enabled={} points {} growth {:.6f} | "
+                    "split {:.6f}/{:.6f}/{:.6f}".format(
+                        iteration,
+                        int(joint_lifecycle_log_metrics["joint_lifecycle_enabled"]),
+                        int(joint_lifecycle_log_metrics["current_point_count"]),
+                        joint_lifecycle_log_metrics["point_growth_ratio_vs_baseline_or_start"],
+                        joint_lifecycle_log_metrics["joint_split_score_mean"],
+                        joint_lifecycle_log_metrics["joint_split_score_std"],
+                        joint_lifecycle_log_metrics["joint_split_score_max"],
+                    )
+                )
+                print(
+                    "[ITER {}] Joint lifecycle extra_split {} | suppressed_by_budget {} | "
+                    "prune_candidate_ratio {:.6f} veto_ratio {:.6f}".format(
+                        iteration,
+                        int(joint_lifecycle_log_metrics["joint_split_trigger_count"]),
+                        int(joint_lifecycle_log_metrics["split_suppressed_by_budget_count"]),
+                        joint_lifecycle_log_metrics["joint_prune_candidate_ratio"],
+                        joint_lifecycle_log_metrics["joint_prune_veto_ratio"],
+                    )
+                )
+                print(
+                    "[ITER {}] Joint lifecycle prune_both {} | split_rgb {} split_th {} | "
+                    "boost_gbm {} boost_thgeo {}".format(
+                        iteration,
+                        int(joint_lifecycle_log_metrics["prune_by_both_modalities_count"]),
+                        int(joint_lifecycle_log_metrics["split_triggered_by_rgb_count"]),
+                        int(joint_lifecycle_log_metrics["split_triggered_by_th_count"]),
+                        int(joint_lifecycle_log_metrics["split_boosted_by_gbm_count"]),
+                        int(joint_lifecycle_log_metrics["split_boosted_by_thgeo_count"]),
+                    )
+                )
+
+            training_report(
+                tb_writer,
+                iteration,
+                Ll1,
+                Ll1_thermal,
+                loss,
+                l1_loss,
+                iter_start.elapsed_time(iter_end),
+                testing_iterations,
+                scene,
+                render,
+                (pipe, background),
+                train_metrics=train_metric_scalars,
+            )
             if (iteration in saving_iterations):
                 print("\n[ITER {}] Saving Gaussians".format(iteration))
                 scene.save(iteration)
@@ -142,10 +374,28 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
                 if iteration > opt.densify_from_iter and iteration % opt.densification_interval == 0:
                     size_threshold = 20 if iteration > opt.opacity_reset_interval else None
-                    gaussians.densify_and_prune(opt.densify_grad_threshold, 0.005, scene.cameras_extent, size_threshold)
+                    gaussians.densify_and_prune(
+                        opt.densify_grad_threshold,
+                        0.005,
+                        scene.cameras_extent,
+                        size_threshold,
+                        iteration=iteration,
+                    )
                 
                 if iteration % opt.opacity_reset_interval == 0 or (dataset.white_background and iteration == opt.densify_from_iter):
                     gaussians.reset_opacity()
+            elif late_prune_phase_active:
+                gaussians.max_radii2D[visibility_filter] = torch.max(
+                    gaussians.max_radii2D[visibility_filter], radii[visibility_filter]
+                )
+                if getattr(opt, "late_prune_interval", 0) > 0 and iteration % opt.late_prune_interval == 0:
+                    removed_count = gaussians.late_prune_only(
+                        min_opacity=0.005,
+                        extent=scene.cameras_extent,
+                        max_screen_size=None,
+                        iteration=iteration,
+                    )
+                    print("[ITER {}] Late prune-only removed {}".format(iteration, removed_count))
 
             # Optimizer step
             if iteration < opt.iterations:
@@ -179,12 +429,15 @@ def prepare_output_and_logger(args):
         print("Tensorboard not available: not logging progress")
     return tb_writer
 
-def training_report(tb_writer, iteration, Ll1, Ll1_thermal, loss, l1_loss, elapsed, testing_iterations, scene : Scene, renderFunc, renderArgs):
+def training_report(tb_writer, iteration, Ll1, Ll1_thermal, loss, l1_loss, elapsed, testing_iterations, scene : Scene, renderFunc, renderArgs, train_metrics=None):
     if tb_writer:
         tb_writer.add_scalar('train_loss_patches/l1_loss', Ll1.item(), iteration)
         tb_writer.add_scalar('train_loss_patches/l1_thermal_loss', Ll1_thermal.item(), iteration)
         tb_writer.add_scalar('train_loss_patches/total_loss', loss.item(), iteration)
         tb_writer.add_scalar('iter_time', elapsed, iteration)
+        if train_metrics:
+            for metric_name, metric_value in train_metrics.items():
+                tb_writer.add_scalar(metric_name, metric_value, iteration)
 
     # Report test and samples of training set
     if iteration in testing_iterations:

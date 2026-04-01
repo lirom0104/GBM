@@ -50,7 +50,15 @@ def render_set(model_path, name, iteration, views, gaussians, pipeline, backgrou
 
 def render_sets(dataset : ModelParams, iteration : int, pipeline : PipelineParams, skip_train : bool, skip_test : bool):
     with torch.no_grad():
-        gaussians = GaussianModel(dataset.sh_degree)
+        gaussians = GaussianModel(
+            dataset.sh_degree,
+            use_gbm=getattr(dataset, "use_gbm", False),
+            use_thermal_residual_geometry=getattr(dataset, "use_thermal_residual_geometry", False),
+            gbm_hidden_dim=getattr(dataset, "gbm_hidden_dim", 32),
+            gbm_gate_init_bias=getattr(dataset, "gbm_gate_init_bias", -2.2),
+            gbm_thermal_grayscale_context=getattr(dataset, "gbm_thermal_grayscale_context", True),
+            gbm_rgb_luma_transfer_only=getattr(dataset, "gbm_rgb_luma_transfer_only", True),
+        )
         scene = Scene(dataset, gaussians, load_iteration=iteration, shuffle=False)
 
         bg_color = [1,1,1] if dataset.white_background else [0, 0, 0]

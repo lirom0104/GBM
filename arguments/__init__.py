@@ -9,7 +9,7 @@
 # For inquiries contact  george.drettakis@inria.fr
 #
 
-from argparse import ArgumentParser, Namespace
+from argparse import ArgumentParser, BooleanOptionalAction, Namespace
 import sys
 import os
 
@@ -28,12 +28,12 @@ class ParamGroup:
             value = value if not fill_none else None 
             if shorthand:
                 if t == bool:
-                    group.add_argument("--" + key, ("-" + key[0:1]), default=value, action="store_true")
+                    group.add_argument("--" + key, ("-" + key[0:1]), default=value, action=BooleanOptionalAction)
                 else:
                     group.add_argument("--" + key, ("-" + key[0:1]), default=value, type=t)
             else:
                 if t == bool:
-                    group.add_argument("--" + key, default=value, action="store_true")
+                    group.add_argument("--" + key, default=value, action=BooleanOptionalAction)
                 else:
                     group.add_argument("--" + key, default=value, type=t)
 
@@ -54,6 +54,14 @@ class ModelParams(ParamGroup):
         self._resolution = -1
         self._white_background = False
         self.data_device = "cuda"
+        # Robust multi-scene default: keep the current dual-modal model path enabled.
+        self.use_gbm = True
+        self.use_thermal_residual_geometry = True
+        self.use_paired_views = True
+        self.gbm_hidden_dim = 32
+        self.gbm_gate_init_bias = -2.2
+        self.gbm_thermal_grayscale_context = True
+        self.gbm_rgb_luma_transfer_only = True
         self.eval = False
         super().__init__(parser, "Loading Parameters", sentinel)
 
@@ -88,7 +96,37 @@ class OptimizationParams(ParamGroup):
         self.densify_from_iter = 500
         self.densify_until_iter = 15_000
         self.densify_grad_threshold = 0.0002
+        self.late_prune_only = True
+        self.late_prune_only_from_iter = 15_000
+        self.late_prune_only_until_iter = 30_000
+        self.late_prune_interval = 250
         self.random_background = False
+        self.thermal_residual_lr_scale = 0.1
+        self.thermal_residual_l1_weight = 1e-4
+        self.gbm_lr_scale = 0.1
+        # v1 defaults: the first relaxed configuration that improved building metrics.
+        self.gbm_stability_weight = 5e-6
+        self.gbm_gate_sparsity_weight = 5e-5
+        self.gbm_gate_collapse_weight = 1e-4
+        self.gbm_gate_overlap_weight = 7.5e-5
+        self.gbm_gate_target_std = 0.1
+        self.anchor_stats_ema = 0.95
+        self.save_anchor_stats = False
+        self.anchor_stats_warmup_iters = 0
+        self.joint_lifecycle = False
+        self.joint_lifecycle_warmup_iters = 5_000
+        self.joint_split_rgb_weight = 1.0
+        self.joint_split_th_weight = 1.0
+        self.joint_split_gbm_boost = 0.04
+        self.joint_split_thgeo_boost = 0.04
+        self.joint_split_score_threshold = 1.2
+        self.joint_split_max_extra_ratio = 0.15
+        self.joint_lifecycle_max_point_ratio = 1.8
+        self.joint_prune_visibility_thresh = 0.05
+        self.joint_prune_contribution_thresh = 0.25
+        self.joint_prune_residual_thresh = 0.25
+        self.joint_prune_gbm_veto_thresh = 1.25
+        self.joint_prune_thgeo_veto_thresh = 1.25
         super().__init__(parser, "Optimization Parameters")
 
 def get_combined_args(parser : ArgumentParser):

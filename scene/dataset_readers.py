@@ -36,6 +36,10 @@ class CameraInfo(NamedTuple):
     thermal_path: str
     width: int
     height: int
+    pair_key: str = ""
+    pair_strategy: str = "exact_basename"
+    pair_fallback_used: bool = False
+    has_paired_view: bool = True
 
 class SceneInfo(NamedTuple):
     point_cloud: BasicPointCloud
@@ -67,8 +71,50 @@ def getNerfppNorm(cam_info):
 
     return {"translate": translate, "radius": radius}
 
+def _normalize_pair_key(path_or_name):
+    stem = Path(path_or_name).stem.lower()
+    return "".join(ch for ch in stem if ch.isalnum())
+
+def _build_pair_candidates(folder):
+    candidates = sorted([path for path in Path(folder).iterdir() if path.is_file()])
+    by_basename = {path.name: str(path) for path in candidates}
+    by_normalized_key = {}
+    normalized_counts = {}
+
+    for path in candidates:
+        pair_key = _normalize_pair_key(path.name)
+        normalized_counts[pair_key] = normalized_counts.get(pair_key, 0) + 1
+
+    for path in candidates:
+        pair_key = _normalize_pair_key(path.name)
+        if normalized_counts[pair_key] == 1:
+            by_normalized_key[pair_key] = str(path)
+
+    return {
+        "sorted_paths": [str(path) for path in candidates],
+        "by_basename": by_basename,
+        "by_normalized_key": by_normalized_key,
+    }
+
+def _resolve_thermal_pair_path(image_basename, pair_candidates, fallback_index):
+    pair_key = _normalize_pair_key(image_basename)
+    thermal_path = pair_candidates["by_basename"].get(image_basename)
+    if thermal_path is not None:
+        return thermal_path, pair_key, "exact_basename", False
+
+    thermal_path = pair_candidates["by_normalized_key"].get(pair_key)
+    if thermal_path is not None:
+        return thermal_path, pair_key, "normalized_stem", True
+
+    sorted_paths = pair_candidates["sorted_paths"]
+    if fallback_index < len(sorted_paths):
+        return sorted_paths[fallback_index], pair_key, "sorted_index", True
+
+    return None, pair_key, "missing", True
+
 def readColmapCameras(cam_extrinsics, cam_intrinsics, images_folder, thermal_folder):
     cam_infos = []
+    thermal_pair_candidates = _build_pair_candidates(thermal_folder)
     for idx, key in enumerate(cam_extrinsics):
         sys.stdout.write('\r')
         # the exact output you're looking for:
@@ -98,16 +144,29 @@ def readColmapCameras(cam_extrinsics, cam_intrinsics, images_folder, thermal_fol
 
         image_path = os.path.join(images_folder, os.path.basename(extr.name))
         image_name = os.path.basename(image_path).split(".")[0]
-        thermal_path = os.path.join(thermal_folder, os.path.basename(extr.name))
+        thermal_path, pair_key, pair_strategy, pair_fallback_used = _resolve_thermal_pair_path(
+            os.path.basename(extr.name),
+            thermal_pair_candidates,
+            idx,
+        )
         
-        if os.path.exists(image_path):
+        if os.path.exists(image_path) and thermal_path is not None and os.path.exists(thermal_path):
             image = Image.open(image_path)
             thermal = Image.open(thermal_path)
 
             cam_info = CameraInfo(uid=uid, R=R, T=T, FovY=FovY, FovX=FovX, image=image,
                                 image_path=image_path, image_name=image_name, width=width, height=height,
-                                thermal=thermal, thermal_path=thermal_path)    
+                                thermal=thermal, thermal_path=thermal_path,
+                                pair_key=pair_key, pair_strategy=pair_strategy,
+                                pair_fallback_used=pair_fallback_used, has_paired_view=True)
             cam_infos.append(cam_info)
+        elif os.path.exists(image_path):
+            print(
+                "\n[Warning] Unable to resolve paired thermal frame for {} under {}. Skipping camera.".format(
+                    os.path.basename(extr.name),
+                    thermal_folder,
+                )
+            )
     sys.stdout.write('\n')
     return cam_infos
 
