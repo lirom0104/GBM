@@ -224,8 +224,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 anchor_stats_log_metrics = gaussians.update_anchor_multimodal_stats(
                     rgb_visibility_filter=render_pkg["rgb_visibility_filter"],
                     thermal_visibility_filter=render_pkg["thermal_visibility_filter"],
-                    rgb_contribution_proxy=_build_anchor_contribution_proxy(render_pkg["rgb_radii"], gaussians.get_opacity),
-                    thermal_contribution_proxy=_build_anchor_contribution_proxy(render_pkg["thermal_radii"], gaussians.get_opacity),
+                    rgb_contribution_proxy=_build_anchor_contribution_proxy(render_pkg["rgb_radii"], gaussians.get_rgb_opacity),
+                    thermal_contribution_proxy=_build_anchor_contribution_proxy(render_pkg["thermal_radii"], gaussians.get_thermal_opacity),
                     rgb_residual_proxy=Ll1.detach(),
                     thermal_residual_proxy=Ll1_thermal.detach(),
                     gbm_usage_th2rgb=render_pkg["gbm_gate_th2rgb_anchor"],

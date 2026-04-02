@@ -113,7 +113,7 @@ class OptimizationParams(ParamGroup):
         self.anchor_stats_ema = 0.95
         self.save_anchor_stats = False
         self.anchor_stats_warmup_iters = 0
-        self.joint_lifecycle = False
+        self.joint_lifecycle = True
         self.joint_lifecycle_warmup_iters = 5_000
         self.joint_split_rgb_weight = 1.0
         self.joint_split_th_weight = 1.0

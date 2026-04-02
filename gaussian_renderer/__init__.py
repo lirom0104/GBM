@@ -120,13 +120,11 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
         feature_bindings=feature_bindings,
     )
 
-    opacity = pc.get_opacity
-
     rgb_head = _render_head(
         rasterizer=rasterizer,
         render_params=rgb_render_params,
         means2D=screenspace_points,
-        opacity=opacity,
+        opacity=rgb_render_params["opacity"],
         viewpoint_camera=viewpoint_camera,
         pc=pc,
         pipe=pipe,
@@ -142,7 +140,7 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
         rasterizer=rasterizer,
         render_params=thermal_render_params,
         means2D=thermal_screenspace_points,
-        opacity=opacity,
+        opacity=thermal_render_params["opacity"],
         viewpoint_camera=viewpoint_camera,
         pc=pc,
         pipe=pipe,

@@ -220,8 +220,7 @@ class GaussianModel:
         self._refresh_optional_parameter_grad_flags()
         self.training_setup(training_args)
         gbm_state = model_args.get("gbm_state") if isinstance(model_args, dict) else None
-        if gbm_state is not None and self.gbm is not None:
-            self.gbm.load_state_dict(gbm_state)
+        self._load_gbm_state_compat(gbm_state)
         self.xyz_gradient_accum = xyz_gradient_accum
         self.denom = denom
         self.anchor_lifecycle = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
@@ -242,23 +241,66 @@ class GaussianModel:
     def _gbm_feature_dim(self):
         return 3 * ((self.max_sh_degree + 1) ** 2)
 
+    def _gbm_anchor_context_dim(self):
+        return 4
+
     def _configure_gbm_module(self):
         if not self.use_gbm:
             self.gbm = None
             return
 
         expected_feature_dim = self._gbm_feature_dim()
+        expected_anchor_context_dim = self._gbm_anchor_context_dim()
         if (
             self.gbm is None
             or self.gbm.feature_dim != expected_feature_dim
             or self.gbm.hidden_dim != self.gbm_hidden_dim
+            or getattr(self.gbm, "anchor_context_dim", 0) != expected_anchor_context_dim
             or self.gbm.gate_init_bias != self.gbm_gate_init_bias
         ):
             self.gbm = GaussianBindingModule(
                 feature_dim=expected_feature_dim,
                 hidden_dim=self.gbm_hidden_dim,
+                anchor_context_dim=expected_anchor_context_dim,
                 gate_init_bias=self.gbm_gate_init_bias,
             ).cuda()
+
+    def _load_gbm_state_compat(self, gbm_state):
+        if gbm_state is None or self.gbm is None:
+            return
+
+        current_state = self.gbm.state_dict()
+        adapted_state = {}
+        incompatible_keys = []
+
+        for key, current_value in current_state.items():
+            loaded_value = gbm_state.get(key)
+            if loaded_value is None:
+                adapted_state[key] = current_value
+                incompatible_keys.append(key)
+                continue
+
+            if loaded_value.shape == current_value.shape:
+                adapted_state[key] = loaded_value
+                continue
+
+            if key == "backbone.0.weight" and loaded_value.shape[0] == current_value.shape[0]:
+                adapted_weight = current_value.new_zeros(current_value.shape)
+                overlap = min(loaded_value.shape[1], current_value.shape[1])
+                adapted_weight[:, :overlap] = loaded_value[:, :overlap]
+                adapted_state[key] = adapted_weight
+                continue
+
+            adapted_state[key] = current_value
+            incompatible_keys.append(key)
+
+        self.gbm.load_state_dict(adapted_state, strict=False)
+        if incompatible_keys:
+            print(
+                "[Warning] GBM checkpoint partially reused; incompatible keys were reinitialized: {}".format(
+                    ", ".join(sorted(incompatible_keys))
+                )
+            )
 
     def _legacy_shared_mode(self):
         return (not self.use_gbm) and (not self.use_thermal_residual_geometry)
@@ -443,7 +485,7 @@ class GaussianModel:
         target.mul_(ema).add_(observed_values * (1.0 - ema))
 
     def _refresh_optional_parameter_grad_flags(self):
-        bias_requires_grad = False
+        bias_requires_grad = True
         delta_requires_grad = self.use_thermal_residual_geometry
         if isinstance(self._opacity_bias_rgb, nn.Parameter):
             self._opacity_bias_rgb.requires_grad_(bias_requires_grad)
@@ -551,15 +593,15 @@ class GaussianModel:
     
     @property
     def get_rgb_opacity(self):
-        return self.get_opacity_base
+        return self.opacity_activation(self._opacity_base + self._opacity_bias_rgb)
 
     @property
     def get_thermal_opacity(self):
-        return self.get_opacity_base
+        return self.opacity_activation(self._opacity_base + self._opacity_bias_th)
 
     @property
     def get_opacity(self):
-        return self.get_opacity_base
+        return torch.maximum(self.get_rgb_opacity, self.get_thermal_opacity)
 
     @property
     def get_thermal_xyz(self):
@@ -609,12 +651,14 @@ class GaussianModel:
         thermal_context_features = thermal_features
         if self.gbm_thermal_grayscale_context:
             thermal_context_features = self._gbm_luma_replicated_features(thermal_features)
+        gbm_anchor_context = self._get_gbm_anchor_context()
 
         gbm_outputs = self.gbm(
             anchor_state=self._get_anchor_summary(),
             rgb_features=rgb_features,
             thermal_features=thermal_features,
             thermal_context_features=thermal_context_features,
+            anchor_context=gbm_anchor_context,
         )
 
         if self.gbm_rgb_luma_transfer_only:
@@ -661,7 +705,7 @@ class GaussianModel:
             means3D=self.get_xyz,
             scaling=self.get_scaling,
             features=feature_bindings["updated_rgb_features"],
-            opacity=self.get_opacity,
+            opacity=self.get_rgb_opacity,
             scaling_modifier=scaling_modifier,
         )
 
@@ -672,7 +716,7 @@ class GaussianModel:
             means3D=self.get_thermal_xyz,
             scaling=self.get_thermal_scaling,
             features=feature_bindings["updated_thermal_features"],
-            opacity=self.get_opacity,
+            opacity=self.get_thermal_opacity,
             scaling_modifier=scaling_modifier,
         )
 
@@ -685,6 +729,23 @@ class GaussianModel:
         if not self.use_thermal_residual_geometry or self.get_xyz.shape[0] == 0:
             return self.get_xyz.new_zeros((self.get_xyz.shape[0],))
         return self._delta_xyz_th.norm(dim=1) + self._delta_scaling_th.norm(dim=1)
+
+    def _get_gbm_anchor_context(self):
+        num_anchors = self.get_xyz.shape[0]
+        device = self._anchor_stats_device()
+        context_dim = self._gbm_anchor_context_dim()
+        if num_anchors == 0:
+            return torch.zeros((0, context_dim), device=device)
+
+        self._ensure_anchor_multimodal_stats(num_anchors)
+        visibility_rgb = torch.clamp(self._anchor_stat_vector("visibility_rgb"), 0.0, 1.0)
+        visibility_th = torch.clamp(self._anchor_stat_vector("visibility_th"), 0.0, 1.0)
+        contribution_rgb = self._normalize_anchor_stat(self._anchor_stat_vector("contribution_rgb"))
+        contribution_th = self._normalize_anchor_stat(self._anchor_stat_vector("contribution_th"))
+        return torch.stack(
+            (visibility_rgb, visibility_th, contribution_rgb, contribution_th),
+            dim=1,
+        )
 
     def get_anchor_multimodal_stats(self):
         self._ensure_anchor_multimodal_stats()
@@ -1113,6 +1174,8 @@ class GaussianModel:
             {'params': [self._thermal_dc], 'lr': training_args.thermal_feature_lr, "name": "thermal_dc", "per_anchor": True},
             {'params': [self._thermal_rest], 'lr': training_args.thermal_feature_lr / 20.0, "name": "t_rest", "per_anchor": True},
             {'params': [self._opacity_base], 'lr': training_args.opacity_lr, "name": "opacity_base", "per_anchor": True},
+            {'params': [self._opacity_bias_rgb], 'lr': training_args.opacity_lr, "name": "opacity_bias_rgb", "per_anchor": True},
+            {'params': [self._opacity_bias_th], 'lr': training_args.opacity_lr, "name": "opacity_bias_th", "per_anchor": True},
             {'params': [self._scaling], 'lr': training_args.scaling_lr, "name": "scaling", "per_anchor": True},
             {'params': [self._rotation], 'lr': training_args.rotation_lr, "name": "rotation", "per_anchor": True},
         ]
@@ -1236,6 +1299,14 @@ class GaussianModel:
         base_opacity_new = inverse_sigmoid(torch.min(self.get_opacity, torch.ones_like(self.get_opacity)*0.01))
         optimizable_tensors = self.replace_tensor_to_optimizer(base_opacity_new, "opacity_base")
         self._opacity_base = optimizable_tensors["opacity_base"]
+        bias_rgb_new = torch.zeros_like(self._opacity_bias_rgb)
+        optimizable_tensors = self.replace_tensor_to_optimizer(bias_rgb_new, "opacity_bias_rgb")
+        if "opacity_bias_rgb" in optimizable_tensors:
+            self._opacity_bias_rgb = optimizable_tensors["opacity_bias_rgb"]
+        bias_th_new = torch.zeros_like(self._opacity_bias_th)
+        optimizable_tensors = self.replace_tensor_to_optimizer(bias_th_new, "opacity_bias_th")
+        if "opacity_bias_th" in optimizable_tensors:
+            self._opacity_bias_th = optimizable_tensors["opacity_bias_th"]
         
 
     def load_ply(self, path):
@@ -1756,8 +1827,7 @@ class GaussianModel:
         )
         self._configure_gbm_module()
         gbm_state = module_state.get("gbm_state")
-        if gbm_state is not None and self.gbm is not None:
-            self.gbm.load_state_dict(gbm_state)
+        self._load_gbm_state_compat(gbm_state)
 
     def save_anchor_stats(self, path):
         if not self.save_anchor_stats_enabled:
